@@ -15,8 +15,8 @@ from tqdm.auto import tqdm
 # ==========================================
 CFG = {
     'IMG_SIZE': 224,
-    'EPOCHS': 3,
-    'LEARNING_RATE': 1e-3,
+    'EPOCHS': 10,           # 학습 횟수를 3 -> 10으로 늘림 (증강 적용 시 더 많이 학습해야 함)
+    'LEARNING_RATE': 1e-4,  # 학습률을 조금 낮춰서 안정적으로 학습
     'BATCH_SIZE': 32,
     'SEED': 42
 }
@@ -28,27 +28,36 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
 
 seed_everything(CFG['SEED'])
+
+# GPU 사용 가능 여부 확인 (WSL2 환경이면 cuda 잡힐 것임)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # ==========================================
-# 2. 데이터 로드 및 전처리 정의
+# 2. 데이터 로드
 # ==========================================
-# 데이터 경로 설정
 train_df = pd.read_csv('./data/train.csv')
 val_df = pd.read_csv('./data/dev.csv')
 test_df = pd.read_csv('./data/sample_submission.csv')
 
-print(f"학습 데이터 개수: {len(train_df)}")
-print(f"검증 데이터 개수: {len(val_df)}")
+print(f"학습 데이터(Train): {len(train_df)}개 - 고정 환경")
+print(f"검증 데이터(Dev): {len(val_df)}개 - 무작위 환경 (중요!)")
+print(f"평가 데이터(Test): {len(test_df)}개 - 제출용")
 
-# 전처리 (베이스라인과 동일 - 증강 없음)
+# ==========================================
+# 3. 전처리 및 데이터 증강 (핵심 수정 부분)
+# ==========================================
+# Train: 고정된 환경의 이미지를 비틀고 색을 바꿔서 '무작위 환경'처럼 보이게 만듦
 train_transform = transforms.Compose([
     transforms.Resize((CFG['IMG_SIZE'], CFG['IMG_SIZE'])),
+    transforms.RandomHorizontalFlip(p=0.5),       # 50% 확률로 좌우 반전
+    transforms.RandomRotation(15),                # 각도 약간 비틀기
+    transforms.ColorJitter(brightness=0.2, contrast=0.2), # 밝기와 대비 변화 (조명 변화 시뮬레이션)
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+# Test/Val: 실제 평가는 원본 이미지 그대로 해야 함
 test_transform = transforms.Compose([
     transforms.Resize((CFG['IMG_SIZE'], CFG['IMG_SIZE'])),
     transforms.ToTensor(),
@@ -56,7 +65,7 @@ test_transform = transforms.Compose([
 ])
 
 # ==========================================
-# 3. 데이터셋 클래스 정의
+# 4. 데이터셋 클래스
 # ==========================================
 class MultiViewDataset(Dataset):
     def __init__(self, df, root_dir, transform=None, is_test=False):
@@ -74,6 +83,7 @@ class MultiViewDataset(Dataset):
         folder_path = os.path.join(self.root_dir, sample_id)
         
         views = []
+        # front, top 두 시점의 이미지를 가져옴
         for name in ["front", "top"]:
             img_path = os.path.join(folder_path, f"{name}.png")
             image = Image.open(img_path).convert("RGB")
@@ -97,18 +107,20 @@ val_loader = DataLoader(val_dataset, batch_size=CFG['BATCH_SIZE'], shuffle=False
 test_loader = DataLoader(test_dataset, batch_size=CFG['BATCH_SIZE'], shuffle=False)
 
 # ==========================================
-# 4. 모델 정의 (MultiViewResNet)
+# 5. 모델 정의
 # ==========================================
 class MultiViewResNet(nn.Module):
     def __init__(self, num_classes=1):
         super(MultiViewResNet, self).__init__()
+        # 사전 학습된 ResNet18 사용
         self.backbone = models.resnet18(weights=ResNet18_Weights.DEFAULT)
         self.feature_extractor = nn.Sequential(*list(self.backbone.children())[:-1])
         
+        # 두 이미지의 특징(512+512)을 합쳐서 판단
         self.classifier = nn.Sequential(
             nn.Linear(512 * 2, 256),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3), # 과적합 방지 위해 드롭아웃 상향
             nn.Linear(256, num_classes)
         )
 
@@ -119,7 +131,7 @@ class MultiViewResNet(nn.Module):
         return self.classifier(combined)
 
 # ==========================================
-# 5. 학습 및 검증 함수 (클래스 밖으로 이동)
+# 6. 학습 및 검증 함수
 # ==========================================
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
@@ -153,43 +165,63 @@ def validate(model, loader, criterion, device):
             all_probs.extend(probs.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     
-    all_probs = np.array(all_probs, dtype=np.float64)
-    all_labels = np.array(all_labels, dtype=np.float64)
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
     
+    # LogLoss 계산 (대회 평가 기준)
     eps = 1e-15
     p = np.clip(all_probs, eps, 1 - eps)
     logloss_score = -np.mean(all_labels * np.log(p) + (1 - all_labels) * np.log(1 - p))
-    acc_score = np.mean((all_probs > 0.5) == all_labels)
+    
+    # 정확도(Accuracy) 계산
+    preds = (all_probs > 0.5).astype(int)
+    acc_score = np.mean(preds == all_labels)
     
     return logloss_score, acc_score
 
 # ==========================================
-# 6. 메인 실행 루프
+# 7. 메인 실행 루프 (Best Model 저장 추가)
 # ==========================================
 if __name__ == '__main__':
+    # 모델 저장할 폴더 만들기
+    if not os.path.exists('./models'):
+        os.makedirs('./models')
+
     model = MultiViewResNet().to(device)
-    criterion = nn.BCEWithLogitsLoss() 
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=CFG['LEARNING_RATE'])
 
-    # --- Training Loop ---
+    best_score = float('inf') # LogLoss는 낮을수록 좋음
+    best_acc = 0
+
     print("\n[Start Training]")
     for epoch in range(1, CFG['EPOCHS'] + 1):
         avg_train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_logloss, val_acc = validate(model, val_loader, criterion, device)
         
-        print(f"Epoch [{epoch}]")
+        print(f"Epoch [{epoch}/{CFG['EPOCHS']}]")
         print(f"  - Train Loss: {avg_train_loss:.4f}")
-        print(f"  - Val Log-Loss: {val_logloss:.6f} | Val Acc: {val_acc:.4f}")
+        print(f"  - Val LogLoss: {val_logloss:.4f} (낮을수록 좋음)")
+        print(f"  - Val Accuracy: {val_acc:.2%} (높을수록 좋음)")
+        
+        # 모델 저장 로직: LogLoss가 더 낮아지면 저장 (가장 똑똑한 모델 기억하기)
+        if val_logloss < best_score:
+            best_score = val_logloss
+            best_acc = val_acc
+            torch.save(model.state_dict(), './models/best_model.pth')
+            print(f"  >>> Best Model Saved! (Score: {best_score:.4f})")
 
-    # --- Inference ---
+    # --- 추론 (Inference) ---
     print("\n[Start Inference]")
+    
+    # 학습이 끝난 후, 가장 성능이 좋았던 모델을 다시 불러옴
+    model.load_state_dict(torch.load('./models/best_model.pth'))
     model.eval()
+    
     all_probs = []
-
     with torch.no_grad():
         for views in tqdm(test_loader, desc="Inference"):
             views = [v.to(device) for v in views]
-            
             outputs = model(views).view(-1)
             probs = torch.sigmoid(outputs)
             all_probs.extend(probs.cpu().numpy())
@@ -198,9 +230,10 @@ if __name__ == '__main__':
     all_probs = np.array(all_probs)
     submission = pd.DataFrame({
         'id': test_df['id'],
-        'unstable_prob': all_probs,
-        'stable_prob': 1.0 - all_probs
+        'unstable_prob': all_probs,      # 불안정 확률
+        'stable_prob': 1.0 - all_probs   # 안정 확률
     })
 
     submission.to_csv('submission.csv', encoding='UTF-8-sig', index=False)
-    print("submission.csv 저장 완료.")
+    print(f"\n최종 제출 파일 저장 완료: submission.csv")
+    print(f"Dev 셋 기준 최고 정확도: {best_acc:.2%}")
