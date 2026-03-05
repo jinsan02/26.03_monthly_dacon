@@ -1,0 +1,20 @@
+# 데이터 폴더 제외 (용량이 큼)
+data/
+*.zip
+
+# 가상환경 폴더 제외
+venv/
+ai_structure_reasoning/
+.env
+
+# 파이썬 캐시 제외
+__pycache__/
+*.pyc
+
+# 모델 파일 (선택사항: 용량이 크면 제외)
+models/
+*.pth
+
+# OS 및 에디터 설정 제외
+.DS_Store
+.vscode/
